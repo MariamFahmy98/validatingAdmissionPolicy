@@ -5,7 +5,16 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	v1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/api/admissionregistration/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/admission/plugin/cel"
+	"k8s.io/apiserver/pkg/admission/plugin/validatingadmissionpolicy"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
 )
 
 type ApplyCommandConfig struct {
@@ -68,81 +77,57 @@ func (c *ApplyCommandConfig) applyCommandHelper() {
 	strategyField, _, _ = unstructured.NestedMap(specField, "strategy")
 
 	fmt.Println("spec.strategy.type:", strategyField["type"])
+	// --------------------------------
+	policyBytes, error := os.ReadFile(c.PolicyPath)
+	if error != nil {
+		fmt.Println("unable to read policy file")
+		return
+	}
 
-	// userHomeDir, err := os.UserHomeDir()
-	// if err != nil {
-	// 	fmt.Printf("error getting user home dir: %v\n", err)
-	// 	os.Exit(1)
-	// }
+	policies, error := GetResource(policyBytes)
+	if error != nil {
+		fmt.Println("unable to get policies")
+		return
+	}
 
-	// kubeConfigPath := filepath.Join(userHomeDir, ".kube", "config")
+	var policy v1alpha1.ValidatingAdmissionPolicy
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(policies[0].Object, &policy)
+	if err != nil {
+		return
+	}
+	fmt.Println("policy.spec.validation[0].expression:", policy.Spec.Validations[0].Expression)
+	fmt.Println("policy.spec.failurepolicy:", policy.Spec.FailurePolicy)
+	fmt.Println("policy.Name:", policy.Name)
+	// --------------------------------
 
-	// kubeConfig, err := clientcmd.BuildConfigFromFlags("", kubeConfigPath)
-	// if err != nil {
-	// 	fmt.Printf("error getting Kubernetes config: %v\n", err)
-	// 	os.Exit(1)
-	// }
+	forbiddenReason := metav1.StatusReasonForbidden
 
-	// clientset, err := kubernetes.NewForConfig(kubeConfig)
-	// if err != nil {
-	// 	fmt.Printf("error getting Kubernetes clientset: %v\n", err)
-	// 	os.Exit(1)
-	// }
+	validationCondition := &validatingadmissionpolicy.ValidationCondition{
+		Expression: policy.Spec.Validations[0].Expression,
+		Message:    "this is the validating condition",
+		Reason:     &forbiddenReason,
+	}
 
-	// dynamicClient, err := dynamic.NewForConfig(kubeConfig)
-	// if err != nil {
-	// 	fmt.Printf("error creating dynamic client: %v\n", err)
-	// 	os.Exit(1)
-	// }
+	var expressions []cel.ExpressionAccessor
+	expressions = append(expressions, validationCondition)
 
-	// b, err := os.ReadFile(c.ResourcePath)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// log.Printf("%q \n", string(b))
+	filterCompiler := cel.NewFilterCompiler()
 
-	// decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(b), 100)
-	// for {
-	// 	var rawObj runtime.RawExtension
-	// 	if err = decoder.Decode(&rawObj); err != nil {
-	// 		break
-	// 	}
+	filter := filterCompiler.Compile(expressions, false)
 
-	// 	obj, gvk, _ := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme).Decode(rawObj.Raw, nil, nil)
-	// 	unstructuredMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-	// 	if err != nil {
-	// 		log.Fatal(err)
-	// 	}
+	// It works good
+	// compileErrors := filter.CompilationErrors()
+	// fmt.Println("error: ", compileErrors[0].Error())
 
-	// 	unstructuredObj := &unstructured.Unstructured{Object: unstructuredMap}
+	admissionAttributes := admission.NewAttributesRecord(resources[0].DeepCopyObject(), nil, resources[0].GroupVersionKind(), "default", "nginx", schema.GroupVersionResource{}, "", admission.Create, nil, false, nil)
+	versionedAttr, _ := generic.NewVersionedAttributes(admissionAttributes, admissionAttributes.GetKind(), nil)
+	fail := v1.Fail
 
-	// 	gr, err := restmapper.GetAPIGroupResources(clientset.Discovery())
-	// 	if err != nil {
-	// 		log.Fatal(err)
-	// 	}
+	validator := validatingadmissionpolicy.NewValidator(filter, &fail)
+	policyResults := validator.Validate(versionedAttr, nil)
 
-	// 	mapper := restmapper.NewDiscoveryRESTMapper(gr)
-	// 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	// 	if err != nil {
-	// 		log.Fatal(err)
-	// 	}
+	fmt.Println("policyResults[0].Action:", policyResults[0].Action)
+	fmt.Println("policyResults[0].Message:", policyResults[0].Message)
+	fmt.Println("policyResults[0].Reason:", policyResults[0].Reason)
 
-	// 	var dri dynamic.ResourceInterface
-	// 	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-	// 		if unstructuredObj.GetNamespace() == "" {
-	// 			unstructuredObj.SetNamespace("default")
-	// 		}
-	// 		dri = dynamicClient.Resource(mapping.Resource).Namespace(unstructuredObj.GetNamespace())
-	// 	} else {
-	// 		dri = dynamicClient.Resource(mapping.Resource)
-	// 	}
-
-	// 	if _, err := dri.Create(context.Background(), unstructuredObj, metav1.CreateOptions{}); err != nil {
-	// 		log.Fatal(err)
-	// 	}
-	// }
-
-	// if err != io.EOF {
-	// 	log.Fatal("eof ", err)
-	// }
 }
