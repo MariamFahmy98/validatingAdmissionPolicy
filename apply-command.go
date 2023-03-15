@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	v1 "k8s.io/api/admissionregistration/v1"
@@ -61,23 +62,6 @@ func (c *ApplyCommandConfig) applyCommandHelper() {
 		return
 	}
 
-	fmt.Println("len(resources):", len(resources))
-	fmt.Println("1st resource kind:", resources[0].GetKind())
-	fmt.Println("1st resource labels:", resources[0].GetLabels())
-	fmt.Println("1st resource kind:", resources[0].GetObjectKind().GroupVersionKind().Kind)
-	fmt.Println("1st resource labels:", resources[0].Object["spec"])
-	fmt.Println("1st resource unstructured content:", resources[0].UnstructuredContent())
-
-	var specField map[string]interface{}
-	specField, _, _ = unstructured.NestedMap(resources[0].UnstructuredContent(), "spec")
-
-	fmt.Println("spec.replicas:", specField["replicas"])
-
-	var strategyField map[string]interface{}
-	strategyField, _, _ = unstructured.NestedMap(specField, "strategy")
-
-	fmt.Println("spec.strategy.type:", strategyField["type"])
-	// --------------------------------
 	policyBytes, error := os.ReadFile(c.PolicyPath)
 	if error != nil {
 		fmt.Println("unable to read policy file")
@@ -95,39 +79,56 @@ func (c *ApplyCommandConfig) applyCommandHelper() {
 	if err != nil {
 		return
 	}
-	fmt.Println("policy.spec.validation[0].expression:", policy.Spec.Validations[0].Expression)
-	fmt.Println("policy.spec.failurepolicy:", policy.Spec.FailurePolicy)
-	fmt.Println("policy.Name:", policy.Name)
-	// --------------------------------
+
+	for _, resource := range resources {
+		policyDecisions := applyPolicyToResource(&policy, resource)
+
+		for _, decision := range policyDecisions {
+			if strings.Compare(string(decision.Action), "deny") == 0 {
+				fmt.Println(decision.Message)
+			} else {
+				fmt.Println(decision.Action)
+			}
+		}
+	}
+}
+
+func applyPolicyToResource(policy *v1alpha1.ValidatingAdmissionPolicy, resource *unstructured.Unstructured) []validatingadmissionpolicy.PolicyDecision {
 
 	forbiddenReason := metav1.StatusReasonForbidden
 
-	validationCondition := &validatingadmissionpolicy.ValidationCondition{
-		Expression: policy.Spec.Validations[0].Expression,
-		Message:    "this is the validating condition",
-		Reason:     &forbiddenReason,
+	var validations []v1alpha1.Validation = policy.Spec.Validations
+	var expressions []cel.ExpressionAccessor
+
+	for _, expression := range validations {
+		message := fmt.Sprintf("error: failed to create %s: %s \"%s\" is forbidden: ValidatingAdmissionPolicy '%s' denied request: failed expression: %s", resource.GetKind(), resource.GetAPIVersion(), resource.GetName(), policy.Name, expression.Expression)
+		condition := &validatingadmissionpolicy.ValidationCondition{
+			Expression: expression.Expression,
+			Message:    message,
+			Reason:     &forbiddenReason,
+		}
+		expressions = append(expressions, condition)
+
 	}
 
-	var expressions []cel.ExpressionAccessor
-	expressions = append(expressions, validationCondition)
-
 	filterCompiler := cel.NewFilterCompiler()
-
 	filter := filterCompiler.Compile(expressions, false)
 
-	// It works good
-	// compileErrors := filter.CompilationErrors()
-	// fmt.Println("error: ", compileErrors[0].Error())
+	compileErrors := filter.CompilationErrors()
 
-	admissionAttributes := admission.NewAttributesRecord(resources[0].DeepCopyObject(), nil, resources[0].GroupVersionKind(), "default", "nginx", schema.GroupVersionResource{}, "", admission.Create, nil, false, nil)
+	if len(compileErrors) > 0 {
+		for _, err := range compileErrors {
+			fmt.Println(err.Error())
+		}
+		return nil
+	}
+
+	admissionAttributes := admission.NewAttributesRecord(resource.DeepCopyObject(), nil, resource.GroupVersionKind(), resource.GetNamespace(), resource.GetName(), schema.GroupVersionResource{}, "", admission.Create, nil, false, nil)
 	versionedAttr, _ := generic.NewVersionedAttributes(admissionAttributes, admissionAttributes.GetKind(), nil)
-	fail := v1.Fail
+	failPolicy := v1.FailurePolicyType(*policy.Spec.FailurePolicy)
 
-	validator := validatingadmissionpolicy.NewValidator(filter, &fail)
-	policyResults := validator.Validate(versionedAttr, nil)
+	validator := validatingadmissionpolicy.NewValidator(filter, &failPolicy)
+	policyDecisions := validator.Validate(versionedAttr, nil)
 
-	fmt.Println("policyResults[0].Action:", policyResults[0].Action)
-	fmt.Println("policyResults[0].Message:", policyResults[0].Message)
-	fmt.Println("policyResults[0].Reason:", policyResults[0].Reason)
-
+	return policyDecisions
 }

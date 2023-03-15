@@ -53,14 +53,11 @@ func convertResourceToUnstructured(resourceYaml []byte) (*unstructured.Unstructu
 			return nil, decodeErr
 		}
 	}
-	fmt.Println("metadata: ", metaData.String())
-	fmt.Println("resourceYaml: ", string(resourceYaml))
 
 	resourceJSON, err := yamlutil.YAMLToJSON(resourceYaml)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("resourceJson: ", string(resourceJSON))
 
 	resource, err := bytesToUnstructured(resourceJSON)
 	if err != nil {
@@ -85,7 +82,6 @@ func SplitDocuments(yamlBytes []byte) (documents [][]byte, error error) {
 	for {
 		// Read one YAML document at a time, until io.EOF is returned
 		b, err := reader.Read()
-		fmt.Println("document bytes: ", string(b))
 		if err == io.EOF || len(b) == 0 {
 			break
 		} else if err != nil {
