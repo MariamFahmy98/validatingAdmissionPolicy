@@ -12,4 +12,11 @@ spec:
       resources:   ["deployments"]
   validations:
     - expression: "object.spec.replicas <= 5"
+      messageExpression: "object.spec.replicas must be less than or equal to 5"
+  auditAnnotations: 
+    - key: "first audit annotation"
+      valueExpression: type(object.spec.metadata.name('[0-9]+'))
+  matchConditions:
+    - name: "first name condition"
+      expression: "object.spec.replicas <= 5"
     

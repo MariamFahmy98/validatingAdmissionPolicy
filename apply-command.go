@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -15,7 +16,8 @@ import (
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/cel"
 	"k8s.io/apiserver/pkg/admission/plugin/validatingadmissionpolicy"
-	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
 )
 
 type ApplyCommandConfig struct {
@@ -94,11 +96,11 @@ func (c *ApplyCommandConfig) applyCommandHelper() {
 }
 
 func applyPolicyToResource(policy *v1alpha1.ValidatingAdmissionPolicy, resource *unstructured.Unstructured) []validatingadmissionpolicy.PolicyDecision {
-
 	forbiddenReason := metav1.StatusReasonForbidden
+	matchPolicyType := v1alpha1.Exact
 
 	var validations []v1alpha1.Validation = policy.Spec.Validations
-	var expressions []cel.ExpressionAccessor
+	var expressions, messageExpressions []cel.ExpressionAccessor
 
 	for _, expression := range validations {
 		message := fmt.Sprintf("error: failed to create %s: %s \"%s\" is forbidden: ValidatingAdmissionPolicy '%s' denied request: failed expression: %s", resource.GetKind(), resource.GetAPIVersion(), resource.GetName(), policy.Name, expression.Expression)
@@ -107,12 +109,17 @@ func applyPolicyToResource(policy *v1alpha1.ValidatingAdmissionPolicy, resource 
 			Message:    message,
 			Reason:     &forbiddenReason,
 		}
-		expressions = append(expressions, condition)
 
+		messageCondition := &validatingadmissionpolicy.MessageExpressionCondition{
+			MessageExpression: expression.MessageExpression,
+		}
+
+		expressions = append(expressions, condition)
+		messageExpressions = append(messageExpressions, messageCondition)
 	}
 
 	filterCompiler := cel.NewFilterCompiler()
-	filter := filterCompiler.Compile(expressions, false)
+	filter := filterCompiler.Compile(expressions, cel.OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, celconfig.PerCallLimit)
 
 	compileErrors := filter.CompilationErrors()
 
@@ -123,12 +130,49 @@ func applyPolicyToResource(policy *v1alpha1.ValidatingAdmissionPolicy, resource 
 		return nil
 	}
 
+	messageExpressionCompiler := cel.NewFilterCompiler()
+	messageExpressionfilter := messageExpressionCompiler.Compile(messageExpressions, cel.OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, celconfig.PerCallLimit)
+
 	admissionAttributes := admission.NewAttributesRecord(resource.DeepCopyObject(), nil, resource.GroupVersionKind(), resource.GetNamespace(), resource.GetName(), schema.GroupVersionResource{}, "", admission.Create, nil, false, nil)
-	versionedAttr, _ := generic.NewVersionedAttributes(admissionAttributes, admissionAttributes.GetKind(), nil)
+	versionedAttr, _ := admission.NewVersionedAttributes(admissionAttributes, admissionAttributes.GetKind(), nil)
+
+	ctx := context.TODO()
 	failPolicy := v1.FailurePolicyType(*policy.Spec.FailurePolicy)
 
-	validator := validatingadmissionpolicy.NewValidator(filter, &failPolicy)
-	policyDecisions := validator.Validate(versionedAttr, nil)
+	matchConditions := policy.Spec.MatchConditions
+	var matchExpressions []cel.ExpressionAccessor
 
-	return policyDecisions
+	for _, expression := range matchConditions {
+		condition := &matchconditions.MatchCondition{
+			Name:       expression.Name,
+			Expression: expression.Expression,
+		}
+		matchExpressions = append(matchExpressions, condition)
+	}
+
+	matchFilterCompiler := cel.NewFilterCompiler()
+	matchFilter := matchFilterCompiler.Compile(matchExpressions, cel.OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, celconfig.PerCallLimit)
+
+	newMatcher := matchconditions.NewMatcher(matchFilter, nil, &failPolicy, string(matchPolicyType), "test")
+
+	auditAnnotations := policy.Spec.AuditAnnotations
+	var auditExpressions []cel.ExpressionAccessor
+
+	for _, expression := range auditAnnotations {
+		condition := &validatingadmissionpolicy.AuditAnnotationCondition{
+			Key:             expression.Key,
+			ValueExpression: expression.ValueExpression,
+		}
+		auditExpressions = append(auditExpressions, condition)
+	}
+
+	auditAnnotationFilterCompiler := cel.NewFilterCompiler()
+	auditAnnotationFilter := auditAnnotationFilterCompiler.Compile(auditExpressions, cel.OptionalVariableDeclarations{HasParams: false, HasAuthorizer: false}, celconfig.PerCallLimit)
+
+	validator := validatingadmissionpolicy.NewValidator(filter, newMatcher, auditAnnotationFilter, messageExpressionfilter, &failPolicy, nil)
+	validateResult := validator.Validate(ctx, versionedAttr, nil, celconfig.RuntimeCELCostBudget)
+
+	//fmt.Println(validateResult.AuditAnnotations[0].Action)
+
+	return validateResult.Decisions
 }
